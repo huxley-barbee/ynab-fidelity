@@ -57,10 +57,6 @@ static bool confirm(const std::string& prompt) {
 // CSV parsing
 // ---------------------------------------------------------------------------
 
-struct CsvRow {
-    std::vector<std::string> fields;
-};
-
 static std::vector<std::string> parseCsvLine(const std::string& line) {
     std::vector<std::string> fields;
     std::string cur;
@@ -99,10 +95,8 @@ struct Record {
 };
 
 static std::string normalizeDate(const std::string& raw) {
-    // Accept MM/DD/YYYY or YYYY-MM-DD
     if (raw.size() == 10 && raw[4] == '-') return raw;
     if (raw.size() >= 8) {
-        // try M/D/YYYY or MM/DD/YYYY
         std::istringstream ss(raw);
         int m, d, y;
         char sep;
@@ -132,7 +126,6 @@ static std::vector<Record> parseFidelityCSV(const std::string& path) {
     std::string line;
     while (std::getline(f, line)) lines.push_back(line);
 
-    // Find header row: must contain "Date" and "Amount"
     int headerIdx = -1;
     std::map<std::string, int> colIdx;
 
@@ -161,7 +154,6 @@ static std::vector<Record> parseFidelityCSV(const std::string& path) {
     };
 
     int cDate = col("date");
-    // Fidelity uses "amount ($)" or "amount"
     int cAmt = -1;
     for (auto& [k, v] : colIdx)
         if (k.find("amount") != std::string::npos) { cAmt = v; break; }
@@ -208,21 +200,23 @@ public:
         if (rc != SQLITE_OK)
             throw std::runtime_error(std::string("Cannot open db: ") + sqlite3_errmsg(db));
 
-        // Set encryption key via SQLCipher
         std::string keyPragma = "PRAGMA key = '" + escapeSql(password) + "';";
         exec(keyPragma);
-
-        // Verify we can read (wrong password → this fails)
         exec("SELECT count(*) FROM sqlite_master;");
     }
 
     void create(const std::string& path, const std::string& password) {
         open(path, password);
         exec(R"(
+            CREATE TABLE IF NOT EXISTS accounts (
+                id   INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE
+            );
             CREATE TABLE IF NOT EXISTS imports (
-                id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                created_at  TEXT NOT NULL,
-                source_file TEXT NOT NULL,
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                account_id   INTEGER NOT NULL REFERENCES accounts(id),
+                created_at   TEXT NOT NULL,
+                source_file  TEXT NOT NULL,
                 record_count INTEGER NOT NULL DEFAULT 0
             );
             CREATE TABLE IF NOT EXISTS records (
@@ -262,26 +256,123 @@ public:
         return st;
     }
 
-    // Returns existing (date, amount, description) tuples to detect duplicates
-    std::set<std::tuple<std::string,double,std::string>> existingKeys() {
-        std::set<std::tuple<std::string,double,std::string>> keys;
-        auto st = prepare("SELECT date, amount, description FROM records;");
+    // ---------------------------------------------------------------------------
+    // Accounts
+    // ---------------------------------------------------------------------------
+
+    struct AccountMeta {
+        int64_t id;
+        std::string name;
+    };
+
+    std::vector<AccountMeta> listAccounts() {
+        std::vector<AccountMeta> out;
+        auto st = prepare("SELECT id, name FROM accounts ORDER BY id;");
         while (sqlite3_step(st.s) == SQLITE_ROW) {
-            std::string d = reinterpret_cast<const char*>(sqlite3_column_text(st.s, 0));
-            double a = sqlite3_column_double(st.s, 1);
+            AccountMeta a;
+            a.id   = sqlite3_column_int64(st.s, 0);
+            a.name = reinterpret_cast<const char*>(sqlite3_column_text(st.s, 1));
+            out.push_back(a);
+        }
+        return out;
+    }
+
+    int64_t createAccount(const std::string& name) {
+        auto st = prepare("INSERT INTO accounts(name) VALUES(?);");
+        sqlite3_bind_text(st.s, 1, name.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_step(st.s);
+        return sqlite3_last_insert_rowid(db);
+    }
+
+    bool accountExists(int64_t id) {
+        auto st = prepare("SELECT 1 FROM accounts WHERE id = ?;");
+        sqlite3_bind_int64(st.s, 1, id);
+        return sqlite3_step(st.s) == SQLITE_ROW;
+    }
+
+    void deleteAccount(int64_t id) {
+        auto st = prepare("DELETE FROM accounts WHERE id = ?;");
+        sqlite3_bind_int64(st.s, 1, id);
+        sqlite3_step(st.s);
+    }
+
+    // ---------------------------------------------------------------------------
+    // Imports
+    // ---------------------------------------------------------------------------
+
+    struct ImportMeta {
+        int64_t id;
+        int64_t account_id;
+        std::string account_name;
+        std::string created_at;
+        std::string source_file;
+        int record_count;
+    };
+
+    std::vector<ImportMeta> listImports(int64_t account_id = 0) {
+        std::string sql =
+            "SELECT i.id, i.account_id, a.name, i.created_at, i.source_file, i.record_count"
+            " FROM imports i JOIN accounts a ON a.id = i.account_id";
+        if (account_id > 0) sql += " WHERE i.account_id = " + std::to_string(account_id);
+        sql += " ORDER BY i.id;";
+        std::vector<ImportMeta> out;
+        auto st = prepare(sql);
+        while (sqlite3_step(st.s) == SQLITE_ROW) {
+            ImportMeta m;
+            m.id           = sqlite3_column_int64(st.s, 0);
+            m.account_id   = sqlite3_column_int64(st.s, 1);
+            m.account_name = reinterpret_cast<const char*>(sqlite3_column_text(st.s, 2));
+            m.created_at   = reinterpret_cast<const char*>(sqlite3_column_text(st.s, 3));
+            m.source_file  = reinterpret_cast<const char*>(sqlite3_column_text(st.s, 4));
+            m.record_count = sqlite3_column_int(st.s, 5);
+            out.push_back(m);
+        }
+        return out;
+    }
+
+    int64_t insertImport(int64_t account_id, const std::string& sourceFile, int count) {
+        auto st = prepare(
+            "INSERT INTO imports(account_id, created_at, source_file, record_count)"
+            " VALUES(?, datetime('now'), ?, ?);");
+        sqlite3_bind_int64(st.s, 1, account_id);
+        sqlite3_bind_text(st.s, 2, sourceFile.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int(st.s, 3, count);
+        sqlite3_step(st.s);
+        return sqlite3_last_insert_rowid(db);
+    }
+
+    bool importExists(int64_t id) {
+        auto st = prepare("SELECT 1 FROM imports WHERE id = ?;");
+        sqlite3_bind_int64(st.s, 1, id);
+        return sqlite3_step(st.s) == SQLITE_ROW;
+    }
+
+    void deleteImport(int64_t import_id) {
+        auto st = prepare("DELETE FROM imports WHERE id = ?;");
+        sqlite3_bind_int64(st.s, 1, import_id);
+        sqlite3_step(st.s);
+    }
+
+    // ---------------------------------------------------------------------------
+    // Records
+    // ---------------------------------------------------------------------------
+
+    // Dedup keys scoped to a single account so the same transaction on two
+    // different accounts is not incorrectly skipped.
+    std::set<std::tuple<std::string,double,std::string>> existingKeys(int64_t account_id) {
+        std::set<std::tuple<std::string,double,std::string>> keys;
+        auto st = prepare(
+            "SELECT r.date, r.amount, r.description"
+            " FROM records r JOIN imports i ON r.import_id = i.id"
+            " WHERE i.account_id = ?;");
+        sqlite3_bind_int64(st.s, 1, account_id);
+        while (sqlite3_step(st.s) == SQLITE_ROW) {
+            std::string d    = reinterpret_cast<const char*>(sqlite3_column_text(st.s, 0));
+            double a         = sqlite3_column_double(st.s, 1);
             std::string desc = reinterpret_cast<const char*>(sqlite3_column_text(st.s, 2));
             keys.emplace(d, a, desc);
         }
         return keys;
-    }
-
-    int64_t insertImport(const std::string& sourceFile, int count) {
-        auto st = prepare(
-            "INSERT INTO imports(created_at, source_file, record_count) VALUES(datetime('now'), ?, ?);");
-        sqlite3_bind_text(st.s, 1, sourceFile.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_int(st.s, 2, count);
-        sqlite3_step(st.s);
-        return sqlite3_last_insert_rowid(db);
     }
 
     void insertRecord(const Record& r) {
@@ -297,44 +388,24 @@ public:
         sqlite3_step(st.s);
     }
 
-    struct ImportMeta {
-        int64_t id;
-        std::string created_at;
-        std::string source_file;
-        int record_count;
-    };
-
-    std::vector<ImportMeta> listImports() {
-        std::vector<ImportMeta> out;
-        auto st = prepare("SELECT id, created_at, source_file, record_count FROM imports ORDER BY id;");
-        while (sqlite3_step(st.s) == SQLITE_ROW) {
-            ImportMeta m;
-            m.id           = sqlite3_column_int64(st.s, 0);
-            m.created_at   = reinterpret_cast<const char*>(sqlite3_column_text(st.s, 1));
-            m.source_file  = reinterpret_cast<const char*>(sqlite3_column_text(st.s, 2));
-            m.record_count = sqlite3_column_int(st.s, 3);
-            out.push_back(m);
-        }
-        return out;
-    }
-
     std::vector<Record> recordsForImport(int64_t import_id) {
         std::vector<Record> out;
         auto st = prepare(
             "SELECT id, import_id, date, description, amount, type, symbol"
             " FROM records WHERE import_id = ? ORDER BY date, id;");
         sqlite3_bind_int64(st.s, 1, import_id);
-        while (sqlite3_step(st.s) == SQLITE_ROW) {
-            Record r;
-            r.id          = sqlite3_column_int64(st.s, 0);
-            r.import_id   = sqlite3_column_int64(st.s, 1);
-            r.date        = reinterpret_cast<const char*>(sqlite3_column_text(st.s, 2));
-            r.description = reinterpret_cast<const char*>(sqlite3_column_text(st.s, 3));
-            r.amount      = sqlite3_column_double(st.s, 4);
-            r.type        = reinterpret_cast<const char*>(sqlite3_column_text(st.s, 5) ? sqlite3_column_text(st.s, 5) : (const unsigned char*)"");
-            r.symbol      = reinterpret_cast<const char*>(sqlite3_column_text(st.s, 6) ? sqlite3_column_text(st.s, 6) : (const unsigned char*)"");
-            out.push_back(r);
-        }
+        while (sqlite3_step(st.s) == SQLITE_ROW) out.push_back(rowToRecord(st.s));
+        return out;
+    }
+
+    std::vector<Record> recordsForAccount(int64_t account_id) {
+        std::vector<Record> out;
+        auto st = prepare(
+            "SELECT r.id, r.import_id, r.date, r.description, r.amount, r.type, r.symbol"
+            " FROM records r JOIN imports i ON r.import_id = i.id"
+            " WHERE i.account_id = ? ORDER BY r.date, r.id;");
+        sqlite3_bind_int64(st.s, 1, account_id);
+        while (sqlite3_step(st.s) == SQLITE_ROW) out.push_back(rowToRecord(st.s));
         return out;
     }
 
@@ -343,37 +414,8 @@ public:
         auto st = prepare(
             "SELECT id, import_id, date, description, amount, type, symbol"
             " FROM records ORDER BY date, id;");
-        while (sqlite3_step(st.s) == SQLITE_ROW) {
-            Record r;
-            r.id          = sqlite3_column_int64(st.s, 0);
-            r.import_id   = sqlite3_column_int64(st.s, 1);
-            r.date        = reinterpret_cast<const char*>(sqlite3_column_text(st.s, 2));
-            r.description = reinterpret_cast<const char*>(sqlite3_column_text(st.s, 3));
-            r.amount      = sqlite3_column_double(st.s, 4);
-            r.type        = reinterpret_cast<const char*>(sqlite3_column_text(st.s, 5) ? sqlite3_column_text(st.s, 5) : (const unsigned char*)"");
-            r.symbol      = reinterpret_cast<const char*>(sqlite3_column_text(st.s, 6) ? sqlite3_column_text(st.s, 6) : (const unsigned char*)"");
-            out.push_back(r);
-        }
+        while (sqlite3_step(st.s) == SQLITE_ROW) out.push_back(rowToRecord(st.s));
         return out;
-    }
-
-    void deleteImport(int64_t import_id) {
-        // CASCADE deletes records
-        auto st = prepare("DELETE FROM imports WHERE id = ?;");
-        sqlite3_bind_int64(st.s, 1, import_id);
-        sqlite3_step(st.s);
-    }
-
-    void deleteRecord(int64_t record_id) {
-        auto st = prepare("DELETE FROM records WHERE id = ?;");
-        sqlite3_bind_int64(st.s, 1, record_id);
-        sqlite3_step(st.s);
-    }
-
-    bool importExists(int64_t id) {
-        auto st = prepare("SELECT 1 FROM imports WHERE id = ?;");
-        sqlite3_bind_int64(st.s, 1, id);
-        return sqlite3_step(st.s) == SQLITE_ROW;
     }
 
     bool recordExists(int64_t id) {
@@ -382,7 +424,25 @@ public:
         return sqlite3_step(st.s) == SQLITE_ROW;
     }
 
+    void deleteRecord(int64_t record_id) {
+        auto st = prepare("DELETE FROM records WHERE id = ?;");
+        sqlite3_bind_int64(st.s, 1, record_id);
+        sqlite3_step(st.s);
+    }
+
 private:
+    static Record rowToRecord(sqlite3_stmt* s) {
+        Record r;
+        r.id          = sqlite3_column_int64(s, 0);
+        r.import_id   = sqlite3_column_int64(s, 1);
+        r.date        = reinterpret_cast<const char*>(sqlite3_column_text(s, 2));
+        r.description = reinterpret_cast<const char*>(sqlite3_column_text(s, 3));
+        r.amount      = sqlite3_column_double(s, 4);
+        r.type        = reinterpret_cast<const char*>(sqlite3_column_text(s, 5) ? sqlite3_column_text(s, 5) : (const unsigned char*)"");
+        r.symbol      = reinterpret_cast<const char*>(sqlite3_column_text(s, 6) ? sqlite3_column_text(s, 6) : (const unsigned char*)"");
+        return r;
+    }
+
     static std::string escapeSql(const std::string& s) {
         std::string out;
         for (char c : s) { if (c == '\'') out += '\''; out += c; }
@@ -395,10 +455,8 @@ private:
 // ---------------------------------------------------------------------------
 
 static std::string ynabDate(const std::string& iso) {
-    // YYYY-MM-DD → MM/DD/YYYY
-    if (iso.size() == 10 && iso[4] == '-') {
+    if (iso.size() == 10 && iso[4] == '-')
         return iso.substr(5,2) + "/" + iso.substr(8,2) + "/" + iso.substr(0,4);
-    }
     return iso;
 }
 
@@ -415,18 +473,15 @@ static void exportYNAB(const std::vector<Record>& records, const std::string& ou
     std::ofstream f(outPath);
     if (!f) throw std::runtime_error("Cannot write: " + outPath);
     f << "Date,Payee,Memo,Outflow,Inflow\n";
+    auto fmt = [](double v) -> std::string {
+        char buf[32]; snprintf(buf, sizeof(buf), "%.2f", v); return buf;
+    };
     for (auto& r : records) {
-        std::string outflow = r.amount < 0 ? std::to_string(-r.amount) : "";
-        std::string inflow  = r.amount > 0 ? std::to_string(r.amount)  : "";
-        // Round to 2dp
-        auto fmt = [](double v) -> std::string {
-            char buf[32]; snprintf(buf, sizeof(buf), "%.2f", v); return buf;
-        };
-        outflow = r.amount < 0 ? fmt(-r.amount) : "";
-        inflow  = r.amount > 0 ? fmt(r.amount)  : "";
+        std::string outflow = r.amount < 0 ? fmt(-r.amount) : "";
+        std::string inflow  = r.amount > 0 ? fmt(r.amount)  : "";
         f << csvQuote(ynabDate(r.date)) << ","
           << csvQuote(r.description)   << ","
-          << ","                        // Memo blank
+          << ","
           << outflow << ","
           << inflow  << "\n";
     }
@@ -479,15 +534,12 @@ static std::vector<YNABRecord> parseYNABExport(const std::string& path) {
     return out;
 }
 
-static void runDiff(DB& db, const std::string& ynabPath) {
+static void runDiff(const std::vector<Record>& dbRecords, const std::string& ynabPath) {
     auto ynabRecords = parseYNABExport(ynabPath);
-    auto dbRecords   = db.allRecords();
 
     std::cout << "\nDB records:   " << dbRecords.size() << "\n";
     std::cout << "YNAB records: " << ynabRecords.size() << "\n\n";
 
-    // Build match key: date + rounded amount
-    // We match on date + amount (to 2dp) since description may differ slightly
     using Key = std::pair<std::string, std::string>;
     auto amtStr = [](double v) { char b[32]; snprintf(b,sizeof(b),"%.2f",v); return std::string(b); };
 
@@ -499,11 +551,8 @@ static void runDiff(DB& db, const std::string& ynabPath) {
     for (auto& r : dbRecords)
         dbCounts[{r.date, amtStr(r.amount)}]++;
 
-    // In DB but not in YNAB
     std::vector<Record> missingFromYNAB;
-    std::map<Key,int> dbRemaining = dbCounts;
     std::map<Key,int> ynabRemaining = ynabCounts;
-
     for (auto& r : dbRecords) {
         Key k = {r.date, amtStr(r.amount)};
         if (ynabRemaining[k] > 0) ynabRemaining[k]--;
@@ -511,6 +560,7 @@ static void runDiff(DB& db, const std::string& ynabPath) {
     }
 
     std::vector<YNABRecord> missingFromDB;
+    std::map<Key,int> dbRemaining = dbCounts;
     for (auto& r : ynabRecords) {
         Key k = {r.date, amtStr(r.amount())};
         if (dbRemaining[k] > 0) dbRemaining[k]--;
@@ -524,15 +574,11 @@ static void runDiff(DB& db, const std::string& ynabPath) {
 
     if (!missingFromYNAB.empty()) {
         std::cout << "=== In DB but NOT in YNAB (" << missingFromYNAB.size() << ") ===\n";
-        std::cout << std::left
-                  << std::setw(12) << "Date"
-                  << std::setw(10) << "Amount"
-                  << "Description\n";
+        std::cout << std::left << std::setw(12) << "Date" << std::setw(10) << "Amount" << "Description\n";
         std::cout << std::string(70, '-') << "\n";
         for (auto& r : missingFromYNAB) {
             char amt[16]; snprintf(amt, sizeof(amt), "%+.2f", r.amount);
-            std::cout << std::setw(12) << r.date
-                      << std::setw(10) << amt
+            std::cout << std::setw(12) << r.date << std::setw(10) << amt
                       << r.description.substr(0, 48) << "\n";
         }
         std::cout << "\n";
@@ -540,15 +586,11 @@ static void runDiff(DB& db, const std::string& ynabPath) {
 
     if (!missingFromDB.empty()) {
         std::cout << "=== In YNAB but NOT in DB (" << missingFromDB.size() << ") ===\n";
-        std::cout << std::left
-                  << std::setw(12) << "Date"
-                  << std::setw(10) << "Amount"
-                  << "Payee\n";
+        std::cout << std::left << std::setw(12) << "Date" << std::setw(10) << "Amount" << "Payee\n";
         std::cout << std::string(70, '-') << "\n";
         for (auto& r : missingFromDB) {
             char amt[16]; snprintf(amt, sizeof(amt), "%+.2f", r.amount());
-            std::cout << std::setw(12) << r.date
-                      << std::setw(10) << amt
+            std::cout << std::setw(12) << r.date << std::setw(10) << amt
                       << r.payee.substr(0, 48) << "\n";
         }
         std::cout << "\n";
@@ -559,16 +601,27 @@ static void runDiff(DB& db, const std::string& ynabPath) {
 // Display helpers
 // ---------------------------------------------------------------------------
 
+static void printAccounts(const std::vector<DB::AccountMeta>& accounts) {
+    if (accounts.empty()) { std::cout << "(no accounts)\n"; return; }
+    std::cout << std::left << std::setw(6) << "ID" << "Name\n";
+    std::cout << std::string(40, '-') << "\n";
+    for (auto& a : accounts)
+        std::cout << std::setw(6) << a.id << a.name << "\n";
+    std::cout << "\n";
+}
+
 static void printImports(const std::vector<DB::ImportMeta>& imports) {
     if (imports.empty()) { std::cout << "(no imports)\n"; return; }
     std::cout << std::left
               << std::setw(6)  << "ID"
+              << std::setw(20) << "Account"
               << std::setw(22) << "Imported at"
               << std::setw(8)  << "Rows"
               << "Source file\n";
-    std::cout << std::string(80, '-') << "\n";
+    std::cout << std::string(90, '-') << "\n";
     for (auto& m : imports) {
         std::cout << std::setw(6)  << m.id
+                  << std::setw(20) << m.account_name.substr(0, 19)
                   << std::setw(22) << m.created_at
                   << std::setw(8)  << m.record_count
                   << m.source_file << "\n";
@@ -595,7 +648,7 @@ static void printRecords(const std::vector<Record>& records) {
 }
 
 // ---------------------------------------------------------------------------
-// Interactive menu
+// Interactive menu helpers
 // ---------------------------------------------------------------------------
 
 static int64_t promptInt(const std::string& prompt) {
@@ -612,6 +665,64 @@ static std::string promptString(const std::string& prompt) {
     return trim(line);
 }
 
+// Show account list and prompt user to pick one or create a new one.
+// Returns the chosen account_id, or 0 on cancel.
+static int64_t pickOrCreateAccount(DB& db) {
+    auto accounts = db.listAccounts();
+    if (!accounts.empty()) {
+        printAccounts(accounts);
+        std::cout << "Enter account ID, or 0 to create a new account: ";
+        std::string line;
+        std::getline(std::cin, line);
+        int64_t id = -1;
+        try { id = std::stoll(trim(line)); } catch (...) {}
+        if (id == 0) {
+            // fall through to create
+        } else {
+            if (db.accountExists(id)) return id;
+            std::cout << "Account not found.\n";
+            return 0;
+        }
+    }
+    std::string name = promptString("New account name: ");
+    if (name.empty()) { std::cout << "Cancelled.\n"; return 0; }
+    int64_t id = db.createAccount(name);
+    std::cout << "Created account \"" << name << "\" (ID " << id << ").\n";
+    return id;
+}
+
+// ---------------------------------------------------------------------------
+// Menu actions
+// ---------------------------------------------------------------------------
+
+static void menuManageAccounts(DB& db) {
+    while (true) {
+        std::cout << "\n-- Accounts --\n";
+        printAccounts(db.listAccounts());
+        std::cout << " a) Create account\n d) Delete account\n b) Back\n> ";
+        std::string ch;
+        std::getline(std::cin, ch);
+        ch = trim(ch);
+        if (ch == "a") {
+            std::string name = promptString("Account name: ");
+            if (name.empty()) continue;
+            int64_t id = db.createAccount(name);
+            std::cout << "Created account \"" << name << "\" (ID " << id << ").\n";
+        } else if (ch == "d") {
+            int64_t id = promptInt("Account ID to delete: ");
+            if (!db.accountExists(id)) { std::cout << "Not found.\n"; continue; }
+            if (!confirm("Delete account " + std::to_string(id) +
+                         "? (imports will be orphaned)")) continue;
+            db.deleteAccount(id);
+            std::cout << "Deleted.\n";
+        } else if (ch == "b" || ch.empty()) {
+            break;
+        } else {
+            std::cout << "Unknown option.\n";
+        }
+    }
+}
+
 static void menuImport(DB& db) {
     std::string path = promptString("Path to Fidelity CSV file: ");
     if (path.empty() || !fs::exists(path)) {
@@ -624,17 +735,18 @@ static void menuImport(DB& db) {
     } catch (std::exception& e) {
         std::cout << "Parse error: " << e.what() << "\n"; return;
     }
-
     std::cout << "Parsed " << parsed.size() << " rows from file.\n";
 
-    // Dedup against DB
-    auto existing = db.existingKeys();
+    int64_t account_id = pickOrCreateAccount(db);
+    if (account_id <= 0) return;
+
+    auto existing = db.existingKeys(account_id);
     std::vector<Record> newRecords;
     for (auto& r : parsed) {
         auto key = std::make_tuple(r.date, r.amount, r.description);
         if (existing.find(key) == existing.end()) {
             newRecords.push_back(r);
-            existing.insert(key); // prevent intra-batch dups too
+            existing.insert(key);
         }
     }
 
@@ -643,11 +755,10 @@ static void menuImport(DB& db) {
               << newRecords.size() << " new record(s) to import.\n";
 
     if (newRecords.empty()) { std::cout << "Nothing to import.\n"; return; }
-
     if (!confirm("Proceed?")) return;
 
     db.exec("BEGIN;");
-    int64_t imp_id = db.insertImport(fs::absolute(path).string(), (int)newRecords.size());
+    int64_t imp_id = db.insertImport(account_id, fs::absolute(path).string(), (int)newRecords.size());
     for (auto& r : newRecords) {
         r.import_id = imp_id;
         db.insertRecord(r);
@@ -657,16 +768,30 @@ static void menuImport(DB& db) {
 }
 
 static void menuListImports(DB& db) {
-    printImports(db.listImports());
+    auto accounts = db.listAccounts();
+    int64_t filter = 0;
+    if (!accounts.empty()) {
+        printAccounts(accounts);
+        filter = promptInt("Filter by account ID (0 = all): ");
+        if (filter < 0) filter = 0;
+    }
+    printImports(db.listImports(filter));
 }
 
 static void menuListRecords(DB& db) {
-    int64_t id = promptInt("Import ID (0 = all records): ");
-    if (id == 0) {
-        printRecords(db.allRecords());
-    } else {
+    std::cout << " 1) By import ID\n 2) By account\n 3) All\n> ";
+    std::string ch; std::getline(std::cin, ch); ch = trim(ch);
+    if (ch == "1") {
+        int64_t id = promptInt("Import ID: ");
         if (!db.importExists(id)) { std::cout << "Import not found.\n"; return; }
         printRecords(db.recordsForImport(id));
+    } else if (ch == "2") {
+        printAccounts(db.listAccounts());
+        int64_t id = promptInt("Account ID: ");
+        if (!db.accountExists(id)) { std::cout << "Account not found.\n"; return; }
+        printRecords(db.recordsForAccount(id));
+    } else {
+        printRecords(db.allRecords());
     }
 }
 
@@ -688,14 +813,23 @@ static void menuDeleteRecord(DB& db) {
 }
 
 static void menuExport(DB& db) {
-    int64_t id = promptInt("Import ID to export (0 = all records): ");
+    std::cout << " 1) By import ID\n 2) By account\n 3) All records\n> ";
+    std::string ch; std::getline(std::cin, ch); ch = trim(ch);
+
     std::vector<Record> records;
-    if (id == 0) {
-        records = db.allRecords();
-    } else {
+    if (ch == "1") {
+        int64_t id = promptInt("Import ID: ");
         if (!db.importExists(id)) { std::cout << "Import not found.\n"; return; }
         records = db.recordsForImport(id);
+    } else if (ch == "2") {
+        printAccounts(db.listAccounts());
+        int64_t id = promptInt("Account ID: ");
+        if (!db.accountExists(id)) { std::cout << "Account not found.\n"; return; }
+        records = db.recordsForAccount(id);
+    } else {
+        records = db.allRecords();
     }
+
     if (records.empty()) { std::cout << "No records to export.\n"; return; }
     std::string outPath = promptString("Output CSV path [ynab_import.csv]: ");
     if (outPath.empty()) outPath = "ynab_import.csv";
@@ -703,11 +837,26 @@ static void menuExport(DB& db) {
 }
 
 static void menuDiff(DB& db) {
+    std::vector<Record> dbRecords;
+    auto accounts = db.listAccounts();
+    if (!accounts.empty()) {
+        printAccounts(accounts);
+        int64_t id = promptInt("Account ID to diff (0 = all): ");
+        if (id > 0) {
+            if (!db.accountExists(id)) { std::cout << "Account not found.\n"; return; }
+            dbRecords = db.recordsForAccount(id);
+        } else {
+            dbRecords = db.allRecords();
+        }
+    } else {
+        dbRecords = db.allRecords();
+    }
+
     std::string path = promptString("Path to YNAB export CSV: ");
     if (path.empty() || !fs::exists(path)) {
         std::cout << "File not found.\n"; return;
     }
-    runDiff(db, path);
+    runDiff(dbRecords, path);
 }
 
 // ---------------------------------------------------------------------------
@@ -737,26 +886,6 @@ int main(int argc, char** argv) {
             std::string pw = readPassword("Password: ");
             try {
                 db.open(dbPath, pw);
-                // ensure schema exists (in case of old db without tables)
-                db.exec(R"(
-                    CREATE TABLE IF NOT EXISTS imports (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        created_at TEXT NOT NULL,
-                        source_file TEXT NOT NULL,
-                        record_count INTEGER NOT NULL DEFAULT 0
-                    );
-                    CREATE TABLE IF NOT EXISTS records (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        import_id INTEGER NOT NULL REFERENCES imports(id) ON DELETE CASCADE,
-                        date TEXT NOT NULL,
-                        description TEXT NOT NULL,
-                        amount REAL NOT NULL,
-                        type TEXT,
-                        symbol TEXT
-                    );
-                    CREATE INDEX IF NOT EXISTS idx_records_dedup
-                        ON records(date, amount, description);
-                )");
             } catch (std::exception& e) {
                 std::cerr << "Could not open database (wrong password?): " << e.what() << "\n";
                 return 1;
@@ -767,7 +896,6 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    // Main menu loop
     while (true) {
         std::cout << "------------------------------------\n";
         std::cout << " 1) Import Fidelity CSV\n";
@@ -777,6 +905,7 @@ int main(int argc, char** argv) {
         std::cout << " 5) Diff against YNAB export\n";
         std::cout << " 6) Delete an import\n";
         std::cout << " 7) Delete a single record\n";
+        std::cout << " 8) Manage accounts\n";
         std::cout << " 0) Quit\n";
         std::cout << "------------------------------------\n";
         std::cout << "> ";
@@ -786,13 +915,14 @@ int main(int argc, char** argv) {
         choice = trim(choice);
 
         try {
-            if (choice == "1") menuImport(db);
+            if      (choice == "1") menuImport(db);
             else if (choice == "2") menuListImports(db);
             else if (choice == "3") menuListRecords(db);
             else if (choice == "4") menuExport(db);
             else if (choice == "5") menuDiff(db);
             else if (choice == "6") menuDeleteImport(db);
             else if (choice == "7") menuDeleteRecord(db);
+            else if (choice == "8") menuManageAccounts(db);
             else if (choice == "0") break;
             else std::cout << "Unknown option.\n";
         } catch (std::exception& e) {
