@@ -134,7 +134,7 @@ static std::vector<Record> parseFidelityCSV(const std::string& path) {
         bool hasDate = false, hasAmt = false;
         for (auto& fld : fields) {
             std::string lo = toLower(fld);
-            if (lo == "date") hasDate = true;
+            if (lo.find("date") != std::string::npos) hasDate = true;
             if (lo.find("amount") != std::string::npos) hasAmt = true;
         }
         if (hasDate && hasAmt) {
@@ -153,11 +153,14 @@ static std::vector<Record> parseFidelityCSV(const std::string& path) {
         return it != colIdx.end() ? it->second : def;
     };
 
-    int cDate = col("date");
+    // Fidelity uses "Date", "Run Date", etc.
+    int cDate = -1;
+    for (auto& [k, v] : colIdx)
+        if (k.find("date") != std::string::npos) { cDate = v; break; }
     int cAmt = -1;
     for (auto& [k, v] : colIdx)
         if (k.find("amount") != std::string::npos) { cAmt = v; break; }
-    int cDesc = col("description", col("name", -1));
+    int cDesc = col("action", col("description", col("name", -1)));
     int cType = col("type", col("transaction type", -1));
     int cSym  = col("symbol", -1);
 
@@ -209,8 +212,9 @@ public:
         open(path, password);
         exec(R"(
             CREATE TABLE IF NOT EXISTS accounts (
-                id   INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT NOT NULL UNIQUE
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                name       TEXT NOT NULL UNIQUE,
+                start_date TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS imports (
                 id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -263,25 +267,43 @@ public:
     struct AccountMeta {
         int64_t id;
         std::string name;
+        std::string start_date;
     };
 
     std::vector<AccountMeta> listAccounts() {
         std::vector<AccountMeta> out;
-        auto st = prepare("SELECT id, name FROM accounts ORDER BY id;");
+        auto st = prepare("SELECT id, name, start_date FROM accounts ORDER BY id;");
         while (sqlite3_step(st.s) == SQLITE_ROW) {
             AccountMeta a;
-            a.id   = sqlite3_column_int64(st.s, 0);
-            a.name = reinterpret_cast<const char*>(sqlite3_column_text(st.s, 1));
+            a.id         = sqlite3_column_int64(st.s, 0);
+            a.name       = reinterpret_cast<const char*>(sqlite3_column_text(st.s, 1));
+            a.start_date = reinterpret_cast<const char*>(sqlite3_column_text(st.s, 2));
             out.push_back(a);
         }
         return out;
     }
 
-    int64_t createAccount(const std::string& name) {
-        auto st = prepare("INSERT INTO accounts(name) VALUES(?);");
+    int64_t createAccount(const std::string& name, const std::string& start_date) {
+        auto st = prepare("INSERT INTO accounts(name, start_date) VALUES(?, ?);");
         sqlite3_bind_text(st.s, 1, name.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(st.s, 2, start_date.c_str(), -1, SQLITE_TRANSIENT);
         sqlite3_step(st.s);
         return sqlite3_last_insert_rowid(db);
+    }
+
+    void updateAccountStartDate(int64_t id, const std::string& start_date) {
+        auto st = prepare("UPDATE accounts SET start_date = ? WHERE id = ?;");
+        sqlite3_bind_text(st.s, 1, start_date.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(st.s, 2, id);
+        sqlite3_step(st.s);
+    }
+
+    std::string accountStartDate(int64_t id) {
+        auto st = prepare("SELECT start_date FROM accounts WHERE id = ?;");
+        sqlite3_bind_int64(st.s, 1, id);
+        if (sqlite3_step(st.s) == SQLITE_ROW)
+            return reinterpret_cast<const char*>(sqlite3_column_text(st.s, 0));
+        return "";
     }
 
     bool accountExists(int64_t id) {
@@ -451,41 +473,111 @@ private:
 };
 
 // ---------------------------------------------------------------------------
-// YNAB export
+// OFX export
 // ---------------------------------------------------------------------------
 
-static std::string ynabDate(const std::string& iso) {
+// YYYY-MM-DD → YYYYMMDD
+static std::string ofxDate(const std::string& iso) {
     if (iso.size() == 10 && iso[4] == '-')
-        return iso.substr(5,2) + "/" + iso.substr(8,2) + "/" + iso.substr(0,4);
+        return iso.substr(0,4) + iso.substr(5,2) + iso.substr(8,2);
     return iso;
 }
 
-static std::string csvQuote(const std::string& s) {
-    if (s.find(',') == std::string::npos && s.find('"') == std::string::npos)
-        return s;
-    std::string out = "\"";
-    for (char c : s) { if (c == '"') out += '"'; out += c; }
-    out += '"';
+// Escape the five XML special characters for OFX element content
+static std::string ofxEscape(const std::string& s) {
+    std::string out;
+    for (char c : s) {
+        switch (c) {
+            case '&':  out += "&amp;";  break;
+            case '<':  out += "&lt;";   break;
+            case '>':  out += "&gt;";   break;
+            case '"':  out += "&quot;"; break;
+            case '\'': out += "&apos;"; break;
+            default:   out += c;
+        }
+    }
     return out;
 }
 
-static void exportYNAB(const std::vector<Record>& records, const std::string& outPath) {
+static std::string todayISO() {
+    time_t t = time(nullptr);
+    struct tm* tm = localtime(&t);
+    char buf[11];
+    snprintf(buf, sizeof(buf), "%04d-%02d-%02d",
+             tm->tm_year + 1900, tm->tm_mon + 1, tm->tm_mday);
+    return std::string(buf);
+}
+
+static void exportOFX(const std::vector<Record>& records, const std::string& outPath,
+                      const std::string& accountName = "") {
+    std::string today = todayISO();
+    std::vector<const Record*> toExport;
+    int skipped = 0;
+    for (auto& r : records) {
+        if (r.date > today) { ++skipped; continue; }
+        toExport.push_back(&r);
+    }
+    if (skipped > 0)
+        std::cout << "Skipping " << skipped << " future-dated record(s) (date > " << today << ").\n";
+
     std::ofstream f(outPath);
     if (!f) throw std::runtime_error("Cannot write: " + outPath);
-    f << "Date,Payee,Memo,Outflow,Inflow\n";
-    auto fmt = [](double v) -> std::string {
-        char buf[32]; snprintf(buf, sizeof(buf), "%.2f", v); return buf;
-    };
-    for (auto& r : records) {
-        std::string outflow = r.amount < 0 ? fmt(-r.amount) : "";
-        std::string inflow  = r.amount > 0 ? fmt(r.amount)  : "";
-        f << csvQuote(ynabDate(r.date)) << ","
-          << csvQuote(r.description)   << ","
-          << ","
-          << outflow << ","
-          << inflow  << "\n";
+
+    // OFX 1.02 SGML header (no XML declaration)
+    f << "OFXHEADER:100\n"
+         "DATA:OFXSGML\n"
+         "VERSION:102\n"
+         "SECURITY:NONE\n"
+         "ENCODING:USASCII\n"
+         "CHARSET:1252\n"
+         "COMPRESSION:NONE\n"
+         "OLDFILEUID:NONE\n"
+         "NEWFILEUID:NONE\n"
+         "\n";
+
+    f << "<OFX>\n"
+         "<SIGNONMSGSRSV1><SONRS>"
+         "<STATUS><CODE>0</CODE><SEVERITY>INFO</SEVERITY></STATUS>"
+         "<DTSERVER>19700101</DTSERVER><LANGUAGE>ENG</LANGUAGE>"
+         "</SONRS></SIGNONMSGSRSV1>\n";
+
+    f << "<BANKMSGSRSV1><STMTTRNRS><TRNUID>1001</TRNUID>"
+         "<STATUS><CODE>0</CODE><SEVERITY>INFO</SEVERITY></STATUS>\n"
+         "<STMTRS><CURDEF>USD</CURDEF>\n";
+
+    std::string acctId = accountName.empty() ? "FYNAB" : accountName;
+    f << "<BANKACCTFROM><BANKID>FIDELITY</BANKID>"
+      << "<ACCTID>" << ofxEscape(acctId) << "</ACCTID>"
+      << "<ACCTTYPE>CHECKING</ACCTTYPE></BANKACCTFROM>\n";
+
+    f << "<BANKTRANLIST>\n";
+    for (const Record* rp : toExport) {
+        const Record& r = *rp;
+        std::string trnType = r.amount >= 0 ? "CREDIT" : "DEBIT";
+        char amt[32]; snprintf(amt, sizeof(amt), "%.2f", r.amount);
+        // FITID: use db rowid when available, otherwise fall back to a hash of
+        // date+amount+description so repeated exports stay stable
+        std::string fitid;
+        if (r.id > 0) {
+            fitid = std::to_string(r.id);
+        } else {
+            size_t h = std::hash<std::string>{}(r.date + amt + r.description);
+            fitid = std::to_string(h);
+        }
+        f << "<STMTTRN>"
+          << "<TRNTYPE>" << trnType << "</TRNTYPE>"
+          << "<DTPOSTED>" << ofxDate(r.date) << "</DTPOSTED>"
+          << "<TRNAMT>" << amt << "</TRNAMT>"
+          << "<FITID>" << fitid << "</FITID>"
+          << "<NAME>" << ofxEscape(r.description) << "</NAME>"
+          << "</STMTTRN>\n";
     }
-    std::cout << "Exported " << records.size() << " records to: " << outPath << "\n";
+    f << "</BANKTRANLIST>\n";
+
+    f << "<LEDGERBAL><BALAMT>0.00</BALAMT><DTASOF>19700101</DTASOF></LEDGERBAL>\n";
+    f << "</STMTRS></STMTTRNRS></BANKMSGSRSV1>\n</OFX>\n";
+
+    std::cout << "Exported " << toExport.size() << " records to: " << outPath << "\n";
 }
 
 // ---------------------------------------------------------------------------
@@ -534,7 +626,18 @@ static std::vector<YNABRecord> parseYNABExport(const std::string& path) {
     return out;
 }
 
-static void runDiff(const std::vector<Record>& dbRecords, const std::string& ynabPath) {
+static int dateToDays(const std::string& iso) {
+    if (iso.size() != 10) return 0;
+    struct tm t = {};
+    t.tm_year = std::stoi(iso.substr(0,4)) - 1900;
+    t.tm_mon  = std::stoi(iso.substr(5,2)) - 1;
+    t.tm_mday = std::stoi(iso.substr(8,2));
+    t.tm_isdst = -1;
+    time_t tt = mktime(&t);
+    return (int)(tt / 86400);
+}
+
+static std::vector<Record> runDiff(const std::vector<Record>& dbRecords, const std::string& ynabPath) {
     auto ynabRecords = parseYNABExport(ynabPath);
 
     std::cout << "\nDB records:   " << dbRecords.size() << "\n";
@@ -567,16 +670,81 @@ static void runDiff(const std::vector<Record>& dbRecords, const std::string& yna
         else missingFromDB.push_back(r);
     }
 
-    if (missingFromYNAB.empty() && missingFromDB.empty()) {
-        std::cout << "✓ Perfect match — all records accounted for on both sides.\n\n";
-        return;
+    // Secondary pass: YNAB "Cash" records that share date+amount with a DB
+    // missing record are likely the same transaction — pull them out separately.
+    struct ProbablyBoth { Record db; YNABRecord ynab; };
+    std::vector<ProbablyBoth> probablyBoth;
+
+    // For each YNAB "Cash" record in missingFromDB, find a DB record in
+    // missingFromYNAB with the same amount and a date within 1 day.
+    // Prefer exact date match over off-by-one.
+    std::set<size_t> dbConsumed;
+    std::set<size_t> ynabConsumed;
+    for (size_t j = 0; j < missingFromDB.size(); ++j) {
+        auto& yr = missingFromDB[j];
+        if (toLower(trim(yr.payee)) != "cash") continue;
+        int ynabDays = dateToDays(yr.date);
+        std::string yAmt = amtStr(yr.amount());
+
+        // Find best match: exact date first, then off-by-one
+        size_t bestIdx = SIZE_MAX;
+        int bestDiff = 2;
+        for (size_t i = 0; i < missingFromYNAB.size(); ++i) {
+            if (dbConsumed.count(i)) continue;
+            if (amtStr(missingFromYNAB[i].amount) != yAmt) continue;
+            int diff = std::abs(dateToDays(missingFromYNAB[i].date) - ynabDays);
+            if (diff <= 1 && diff < bestDiff) { bestDiff = diff; bestIdx = i; }
+        }
+        if (bestIdx == SIZE_MAX) continue;
+        dbConsumed.insert(bestIdx);
+        ynabConsumed.insert(j);
+        probablyBoth.push_back({missingFromYNAB[bestIdx], yr});
     }
 
-    if (!missingFromYNAB.empty()) {
-        std::cout << "=== In DB but NOT in YNAB (" << missingFromYNAB.size() << ") ===\n";
+    // Rebuild the missing lists without the consumed entries, splitting
+    // future-dated DB records into a separate bucket.
+    std::string today = todayISO();
+    std::vector<Record> confirmedMissingFromYNAB;
+    std::vector<Record> futureRecords;
+    for (size_t i = 0; i < missingFromYNAB.size(); ++i) {
+        if (dbConsumed.count(i)) continue;
+        if (missingFromYNAB[i].date > today)
+            futureRecords.push_back(missingFromYNAB[i]);
+        else
+            confirmedMissingFromYNAB.push_back(missingFromYNAB[i]);
+    }
+
+    std::vector<YNABRecord> confirmedMissingFromDB;
+    for (size_t j = 0; j < missingFromDB.size(); ++j)
+        if (!ynabConsumed.count(j)) confirmedMissingFromDB.push_back(missingFromDB[j]);
+
+    if (confirmedMissingFromYNAB.empty() && confirmedMissingFromDB.empty() &&
+        probablyBoth.empty() && futureRecords.empty()) {
+        std::cout << "✓ Perfect match — all records accounted for on both sides.\n\n";
+        return {};
+    }
+
+    if (!probablyBoth.empty()) {
+        std::cout << "=== Probably In Both — YNAB payee is \"Cash\" (" << probablyBoth.size() << ") ===\n";
+        std::cout << std::left << std::setw(22) << "Date (DB/YNAB)" << std::setw(10) << "Amount"
+                  << std::setw(40) << "DB Description" << "YNAB Payee\n";
+        std::cout << std::string(80, '-') << "\n";
+        for (auto& p : probablyBoth) {
+            char amt[16]; snprintf(amt, sizeof(amt), "%+.2f", p.db.amount);
+            std::string dateCol = p.db.date;
+            if (p.db.date != p.ynab.date) dateCol += "/" + p.ynab.date;
+            std::cout << std::setw(22) << dateCol << std::setw(10) << amt
+                      << std::setw(40) << p.db.description.substr(0, 39)
+                      << p.ynab.payee << "\n";
+        }
+        std::cout << "\n";
+    }
+
+    if (!confirmedMissingFromYNAB.empty()) {
+        std::cout << "=== In DB but NOT in YNAB (" << confirmedMissingFromYNAB.size() << ") ===\n";
         std::cout << std::left << std::setw(12) << "Date" << std::setw(10) << "Amount" << "Description\n";
         std::cout << std::string(70, '-') << "\n";
-        for (auto& r : missingFromYNAB) {
+        for (auto& r : confirmedMissingFromYNAB) {
             char amt[16]; snprintf(amt, sizeof(amt), "%+.2f", r.amount);
             std::cout << std::setw(12) << r.date << std::setw(10) << amt
                       << r.description.substr(0, 48) << "\n";
@@ -584,17 +752,31 @@ static void runDiff(const std::vector<Record>& dbRecords, const std::string& yna
         std::cout << "\n";
     }
 
-    if (!missingFromDB.empty()) {
-        std::cout << "=== In YNAB but NOT in DB (" << missingFromDB.size() << ") ===\n";
+    if (!confirmedMissingFromDB.empty()) {
+        std::cout << "=== In YNAB but NOT in DB (" << confirmedMissingFromDB.size() << ") ===\n";
         std::cout << std::left << std::setw(12) << "Date" << std::setw(10) << "Amount" << "Payee\n";
         std::cout << std::string(70, '-') << "\n";
-        for (auto& r : missingFromDB) {
+        for (auto& r : confirmedMissingFromDB) {
             char amt[16]; snprintf(amt, sizeof(amt), "%+.2f", r.amount());
             std::cout << std::setw(12) << r.date << std::setw(10) << amt
                       << r.payee.substr(0, 48) << "\n";
         }
         std::cout << "\n";
     }
+
+    if (!futureRecords.empty()) {
+        std::cout << "=== Future-dated — in DB but will NOT be exported (" << futureRecords.size() << ") ===\n";
+        std::cout << std::left << std::setw(12) << "Date" << std::setw(10) << "Amount" << "Description\n";
+        std::cout << std::string(70, '-') << "\n";
+        for (auto& r : futureRecords) {
+            char amt[16]; snprintf(amt, sizeof(amt), "%+.2f", r.amount);
+            std::cout << std::setw(12) << r.date << std::setw(10) << amt
+                      << r.description.substr(0, 48) << "\n";
+        }
+        std::cout << "\n";
+    }
+
+    return confirmedMissingFromYNAB;
 }
 
 // ---------------------------------------------------------------------------
@@ -603,10 +785,10 @@ static void runDiff(const std::vector<Record>& dbRecords, const std::string& yna
 
 static void printAccounts(const std::vector<DB::AccountMeta>& accounts) {
     if (accounts.empty()) { std::cout << "(no accounts)\n"; return; }
-    std::cout << std::left << std::setw(6) << "ID" << "Name\n";
-    std::cout << std::string(40, '-') << "\n";
+    std::cout << std::left << std::setw(6) << "ID" << std::setw(30) << "Name" << "Start date\n";
+    std::cout << std::string(50, '-') << "\n";
     for (auto& a : accounts)
-        std::cout << std::setw(6) << a.id << a.name << "\n";
+        std::cout << std::setw(6) << a.id << std::setw(30) << a.name << a.start_date << "\n";
     std::cout << "\n";
 }
 
@@ -686,8 +868,11 @@ static int64_t pickOrCreateAccount(DB& db) {
     }
     std::string name = promptString("New account name: ");
     if (name.empty()) { std::cout << "Cancelled.\n"; return 0; }
-    int64_t id = db.createAccount(name);
-    std::cout << "Created account \"" << name << "\" (ID " << id << ").\n";
+    std::string start_date = promptString("Start date (YYYY-MM-DD): ");
+    start_date = normalizeDate(start_date);
+    if (start_date.size() != 10) { std::cout << "Invalid date.\n"; return 0; }
+    int64_t id = db.createAccount(name, start_date);
+    std::cout << "Created account \"" << name << "\" starting " << start_date << " (ID " << id << ").\n";
     return id;
 }
 
@@ -699,15 +884,26 @@ static void menuManageAccounts(DB& db) {
     while (true) {
         std::cout << "\n-- Accounts --\n";
         printAccounts(db.listAccounts());
-        std::cout << " a) Create account\n d) Delete account\n b) Back\n> ";
+        std::cout << " a) Create account\n s) Set start date\n d) Delete account\n b) Back\n> ";
         std::string ch;
         std::getline(std::cin, ch);
         ch = trim(ch);
         if (ch == "a") {
             std::string name = promptString("Account name: ");
             if (name.empty()) continue;
-            int64_t id = db.createAccount(name);
-            std::cout << "Created account \"" << name << "\" (ID " << id << ").\n";
+            std::string start_date = promptString("Start date (YYYY-MM-DD): ");
+            start_date = normalizeDate(start_date);
+            if (start_date.size() != 10) { std::cout << "Invalid date.\n"; continue; }
+            int64_t id = db.createAccount(name, start_date);
+            std::cout << "Created account \"" << name << "\" starting " << start_date << " (ID " << id << ").\n";
+        } else if (ch == "s") {
+            int64_t id = promptInt("Account ID: ");
+            if (!db.accountExists(id)) { std::cout << "Not found.\n"; continue; }
+            std::string start_date = promptString("New start date (YYYY-MM-DD): ");
+            start_date = normalizeDate(start_date);
+            if (start_date.size() != 10) { std::cout << "Invalid date.\n"; continue; }
+            db.updateAccountStartDate(id, start_date);
+            std::cout << "Updated.\n";
         } else if (ch == "d") {
             int64_t id = promptInt("Account ID to delete: ");
             if (!db.accountExists(id)) { std::cout << "Not found.\n"; continue; }
@@ -740,19 +936,46 @@ static void menuImport(DB& db) {
     int64_t account_id = pickOrCreateAccount(db);
     if (account_id <= 0) return;
 
-    auto existing = db.existingKeys(account_id);
-    std::vector<Record> newRecords;
-    for (auto& r : parsed) {
-        auto key = std::make_tuple(r.date, r.amount, r.description);
-        if (existing.find(key) == existing.end()) {
-            newRecords.push_back(r);
-            existing.insert(key);
+    std::string start_date = db.accountStartDate(account_id);
+    int beforeStart = 0;
+    if (!start_date.empty()) {
+        std::vector<Record> filtered;
+        for (auto& r : parsed) {
+            if (r.date < start_date) ++beforeStart;
+            else filtered.push_back(r);
         }
+        parsed = std::move(filtered);
+        if (beforeStart > 0)
+            std::cout << "Ignoring " << beforeStart << " record(s) before account start date " << start_date << ".\n";
     }
 
-    int skipped = (int)parsed.size() - (int)newRecords.size();
-    std::cout << "Skipping " << skipped << " duplicate(s). "
-              << newRecords.size() << " new record(s) to import.\n";
+    auto dbKeys = db.existingKeys(account_id);
+
+    std::vector<Record> newRecords;
+    std::vector<Record> dbDups;
+
+    for (auto& r : parsed) {
+        auto key = std::make_tuple(r.date, r.amount, r.description);
+        if (dbKeys.count(key))
+            dbDups.push_back(r);
+        else
+            newRecords.push_back(r);
+    }
+
+    if (!dbDups.empty()) {
+        std::cout << "\nAlready in database (" << dbDups.size() << ") — will skip:\n";
+        std::cout << std::left << std::setw(12) << "Date"
+                  << std::setw(10) << "Amount" << "Description\n";
+        std::cout << std::string(70, '-') << "\n";
+        for (auto& r : dbDups) {
+            char amt[16]; snprintf(amt, sizeof(amt), "%+.2f", r.amount);
+            std::cout << std::setw(12) << r.date << std::setw(10) << amt
+                      << r.description.substr(0, 48) << "\n";
+        }
+        std::cout << "\n";
+    }
+
+    std::cout << newRecords.size() << " new record(s) to import.\n";
 
     if (newRecords.empty()) { std::cout << "Nothing to import.\n"; return; }
     if (!confirm("Proceed?")) return;
@@ -817,23 +1040,26 @@ static void menuExport(DB& db) {
     std::string ch; std::getline(std::cin, ch); ch = trim(ch);
 
     std::vector<Record> records;
+    std::string accountName;
     if (ch == "1") {
         int64_t id = promptInt("Import ID: ");
         if (!db.importExists(id)) { std::cout << "Import not found.\n"; return; }
         records = db.recordsForImport(id);
     } else if (ch == "2") {
-        printAccounts(db.listAccounts());
+        auto accounts = db.listAccounts();
+        printAccounts(accounts);
         int64_t id = promptInt("Account ID: ");
         if (!db.accountExists(id)) { std::cout << "Account not found.\n"; return; }
         records = db.recordsForAccount(id);
+        for (auto& a : accounts) if (a.id == id) { accountName = a.name; break; }
     } else {
         records = db.allRecords();
     }
 
     if (records.empty()) { std::cout << "No records to export.\n"; return; }
-    std::string outPath = promptString("Output CSV path [ynab_import.csv]: ");
-    if (outPath.empty()) outPath = "ynab_import.csv";
-    exportYNAB(records, outPath);
+    std::string outPath = promptString("Output OFX path [ynab_import.ofx]: ");
+    if (outPath.empty()) outPath = "ynab_import.ofx";
+    exportOFX(records, outPath, accountName);
 }
 
 static void menuDiff(DB& db) {
@@ -856,7 +1082,15 @@ static void menuDiff(DB& db) {
     if (path.empty() || !fs::exists(path)) {
         std::cout << "File not found.\n"; return;
     }
-    runDiff(dbRecords, path);
+    auto missingFromYNAB = runDiff(dbRecords, path);
+
+    if (!missingFromYNAB.empty() &&
+        confirm("Export the " + std::to_string(missingFromYNAB.size()) +
+                " DB-only record(s) as a YNAB import OFX?")) {
+        std::string outPath = promptString("Output OFX path [ynab_import.ofx]: ");
+        if (outPath.empty()) outPath = "ynab_import.ofx";
+        exportOFX(missingFromYNAB, outPath);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -901,7 +1135,7 @@ int main(int argc, char** argv) {
         std::cout << " 1) Import Fidelity CSV\n";
         std::cout << " 2) List imports\n";
         std::cout << " 3) List records\n";
-        std::cout << " 4) Export to YNAB CSV\n";
+        std::cout << " 4) Export to YNAB OFX\n";
         std::cout << " 5) Diff against YNAB export\n";
         std::cout << " 6) Delete an import\n";
         std::cout << " 7) Delete a single record\n";
