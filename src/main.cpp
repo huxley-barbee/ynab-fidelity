@@ -118,7 +118,8 @@ static double parseAmount(const std::string& s) {
 
 // Returns records parsed from a Fidelity CSV file.
 // Fidelity exports have a variable number of header rows before the column row.
-static std::vector<Record> parseFidelityCSV(const std::string& path) {
+// If skipProcessing is true, rows where "Cash Balance ($)" == "Processing" are dropped.
+static std::vector<Record> parseFidelityCSV(const std::string& path, bool skipProcessing = false) {
     std::ifstream f(path);
     if (!f) throw std::runtime_error("Cannot open file: " + path);
 
@@ -160,18 +161,24 @@ static std::vector<Record> parseFidelityCSV(const std::string& path) {
     int cAmt = -1;
     for (auto& [k, v] : colIdx)
         if (k.find("amount") != std::string::npos) { cAmt = v; break; }
-    int cDesc = col("action", col("description", col("name", -1)));
-    int cType = col("type", col("transaction type", -1));
-    int cSym  = col("symbol", -1);
+    int cDesc    = col("action", col("description", col("name", -1)));
+    int cType    = col("type", col("transaction type", -1));
+    int cSym     = col("symbol", -1);
+    int cCashBal = col("cash balance ($)", -1);
 
     if (cDate < 0 || cAmt < 0)
         throw std::runtime_error("Missing required columns in: " + path);
 
     std::vector<Record> records;
+    int skippedProcessing = 0;
     for (int i = headerIdx + 1; i < (int)lines.size(); ++i) {
         if (trim(lines[i]).empty()) continue;
         auto flds = parseCsvLine(lines[i]);
         if ((int)flds.size() <= std::max(cDate, cAmt)) continue;
+
+        if (skipProcessing && cCashBal >= 0 && cCashBal < (int)flds.size()) {
+            if (trim(flds[cCashBal]) == "Processing") { ++skippedProcessing; continue; }
+        }
 
         std::string dateRaw = cDate < (int)flds.size() ? flds[cDate] : "";
         std::string amtRaw  = cAmt  < (int)flds.size() ? flds[cAmt]  : "";
@@ -185,6 +192,8 @@ static std::vector<Record> parseFidelityCSV(const std::string& path) {
         r.symbol      = cSym  >= 0 && cSym  < (int)flds.size() ? flds[cSym]  : "";
         records.push_back(r);
     }
+    if (skippedProcessing > 0)
+        std::cout << "Skipping " << skippedProcessing << " record(s) with Cash Balance 'Processing'.\n";
     return records;
 }
 
@@ -925,9 +934,11 @@ static void menuImport(DB& db) {
         std::cout << "File not found.\n"; return;
     }
 
+    bool skipProcessing = confirm("Skip records where Cash Balance ($) is 'Processing'?");
+
     std::vector<Record> parsed;
     try {
-        parsed = parseFidelityCSV(path);
+        parsed = parseFidelityCSV(path, skipProcessing);
     } catch (std::exception& e) {
         std::cout << "Parse error: " << e.what() << "\n"; return;
     }
@@ -975,9 +986,19 @@ static void menuImport(DB& db) {
         std::cout << "\n";
     }
 
-    std::cout << newRecords.size() << " new record(s) to import.\n";
-
     if (newRecords.empty()) { std::cout << "Nothing to import.\n"; return; }
+
+    std::cout << "\nNew records to import (" << newRecords.size() << "):\n";
+    std::cout << std::left << std::setw(12) << "Date"
+              << std::setw(10) << "Amount" << "Description\n";
+    std::cout << std::string(70, '-') << "\n";
+    for (auto& r : newRecords) {
+        char amt[16]; snprintf(amt, sizeof(amt), "%+.2f", r.amount);
+        std::cout << std::setw(12) << r.date << std::setw(10) << amt
+                  << r.description.substr(0, 48) << "\n";
+    }
+    std::cout << "\n";
+
     if (!confirm("Proceed?")) return;
 
     db.exec("BEGIN;");
@@ -1027,12 +1048,86 @@ static void menuDeleteImport(DB& db) {
     std::cout << "Deleted.\n";
 }
 
-static void menuDeleteRecord(DB& db) {
-    int64_t id = promptInt("Record row ID to delete: ");
-    if (!db.recordExists(id)) { std::cout << "Record not found.\n"; return; }
-    if (!confirm("Delete record " + std::to_string(id) + "?")) return;
-    db.deleteRecord(id);
-    std::cout << "Deleted.\n";
+// Parse "1, 3-5, 7" into {1, 3, 4, 5, 7}. Returns empty set on parse error.
+static std::set<int64_t> parseRecordIds(const std::string& input) {
+    std::set<int64_t> ids;
+    std::istringstream ss(input);
+    std::string token;
+    while (std::getline(ss, token, ',')) {
+        token = trim(token);
+        if (token.empty()) continue;
+        auto dash = token.find('-');
+        if (dash != std::string::npos) {
+            std::string lo = trim(token.substr(0, dash));
+            std::string hi = trim(token.substr(dash + 1));
+            if (lo.empty() || hi.empty()) return {};
+            try {
+                int64_t a = std::stoll(lo), b = std::stoll(hi);
+                if (a > b) return {};
+                for (int64_t i = a; i <= b; ++i) ids.insert(i);
+            } catch (...) { return {}; }
+        } else {
+            try { ids.insert(std::stoll(token)); } catch (...) { return {}; }
+        }
+    }
+    return ids;
+}
+
+static void menuDeleteRecords(DB& db) {
+    std::string input = promptString("Record ID(s) to delete (e.g. 1, 3-5, 7): ");
+    if (input.empty()) return;
+
+    auto ids = parseRecordIds(input);
+    if (ids.empty()) { std::cout << "Invalid input.\n"; return; }
+
+    // Reject entirely if any ID doesn't exist
+    std::vector<int64_t> missing;
+    for (int64_t id : ids)
+        if (!db.recordExists(id)) missing.push_back(id);
+
+    if (!missing.empty()) {
+        std::cout << "Record(s) not found: ";
+        for (size_t i = 0; i < missing.size(); ++i) {
+            if (i) std::cout << ", ";
+            std::cout << missing[i];
+        }
+        std::cout << ". Nothing deleted.\n";
+        return;
+    }
+
+    // Fetch records for display
+    std::vector<Record> found;
+    for (int64_t id : ids) {
+        auto st = db.prepare(
+            "SELECT id, import_id, date, description, amount, type, symbol"
+            " FROM records WHERE id = ?;");
+        sqlite3_bind_int64(st.s, 1, id);
+        if (sqlite3_step(st.s) == SQLITE_ROW) {
+            Record r;
+            r.id          = sqlite3_column_int64(st.s, 0);
+            r.import_id   = sqlite3_column_int64(st.s, 1);
+            r.date        = reinterpret_cast<const char*>(sqlite3_column_text(st.s, 2));
+            r.description = reinterpret_cast<const char*>(sqlite3_column_text(st.s, 3));
+            r.amount      = sqlite3_column_double(st.s, 4);
+            found.push_back(r);
+        }
+    }
+
+    std::cout << "\nRecords to delete (" << found.size() << "):\n";
+    std::cout << std::left << std::setw(8) << "ID"
+              << std::setw(12) << "Date"
+              << std::setw(10) << "Amount" << "Description\n";
+    std::cout << std::string(70, '-') << "\n";
+    for (auto& r : found) {
+        char amt[16]; snprintf(amt, sizeof(amt), "%+.2f", r.amount);
+        std::cout << std::setw(8) << r.id << std::setw(12) << r.date
+                  << std::setw(10) << amt << r.description.substr(0, 40) << "\n";
+    }
+    std::cout << "\n";
+
+    if (!confirm("Delete " + std::to_string(found.size()) + " record(s)?")) return;
+    for (auto& r : found) db.deleteRecord(r.id);
+    std::cout << "Deleted " << found.size() << " record(s).\n";
 }
 
 static void menuExport(DB& db) {
@@ -1138,7 +1233,7 @@ int main(int argc, char** argv) {
         std::cout << " 4) Export to YNAB OFX\n";
         std::cout << " 5) Diff against YNAB export\n";
         std::cout << " 6) Delete an import\n";
-        std::cout << " 7) Delete a single record\n";
+        std::cout << " 7) Delete records\n";
         std::cout << " 8) Manage accounts\n";
         std::cout << " 0) Quit\n";
         std::cout << "------------------------------------\n";
@@ -1155,7 +1250,7 @@ int main(int argc, char** argv) {
             else if (choice == "4") menuExport(db);
             else if (choice == "5") menuDiff(db);
             else if (choice == "6") menuDeleteImport(db);
-            else if (choice == "7") menuDeleteRecord(db);
+            else if (choice == "7") menuDeleteRecords(db);
             else if (choice == "8") menuManageAccounts(db);
             else if (choice == "0") break;
             else std::cout << "Unknown option.\n";
