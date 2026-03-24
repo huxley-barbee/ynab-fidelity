@@ -1009,6 +1009,16 @@ static void menuImport(DB& db) {
     }
     db.exec("COMMIT;");
     std::cout << "Imported " << newRecords.size() << " records (import ID " << imp_id << ").\n";
+
+    if (confirm("Export import " + std::to_string(imp_id) + " to YNAB OFX now?")) {
+        std::string accountName;
+        for (auto& a : db.listAccounts())
+            if (a.id == account_id) { accountName = a.name; break; }
+        auto records = db.recordsForImport(imp_id);
+        std::string outPath = promptString("Output OFX path [ynab_import.ofx]: ");
+        if (outPath.empty()) outPath = "ynab_import.ofx";
+        exportOFX(records, outPath, accountName);
+    }
 }
 
 static void menuListImports(DB& db) {
