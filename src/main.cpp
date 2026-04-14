@@ -849,6 +849,14 @@ static int64_t promptInt(const std::string& prompt) {
     try { return std::stoll(trim(line)); } catch (...) { return -1; }
 }
 
+static std::string ofxDefaultFilename(const std::string& accountName) {
+    if (accountName.empty()) return "ynab_import.ofx";
+    std::string safe;
+    for (char c : accountName)
+        safe += (c == ' ' ? '_' : (std::isalnum(c) || c == '-') ? c : '_');
+    return "ynab_import-" + safe + ".ofx";
+}
+
 static std::string promptString(const std::string& prompt) {
     std::cout << prompt;
     std::string line;
@@ -928,12 +936,7 @@ static void menuManageAccounts(DB& db) {
     }
 }
 
-static void menuImport(DB& db) {
-    std::string path = promptString("Path to Fidelity CSV file: ");
-    if (path.empty() || !fs::exists(path)) {
-        std::cout << "File not found.\n"; return;
-    }
-
+static void menuImportFromPath(DB& db, const std::string& path) {
     bool skipProcessing = confirm("Skip records where Cash Balance ($) is 'Processing'?");
 
     std::vector<Record> parsed;
@@ -1015,10 +1018,56 @@ static void menuImport(DB& db) {
         for (auto& a : db.listAccounts())
             if (a.id == account_id) { accountName = a.name; break; }
         auto records = db.recordsForImport(imp_id);
-        std::string outPath = promptString("Output OFX path [ynab_import.ofx]: ");
-        if (outPath.empty()) outPath = "ynab_import.ofx";
+        std::string ofxDefault = ofxDefaultFilename(accountName);
+        std::string outPath = promptString("Output OFX path [" + ofxDefault + "]: ");
+        if (outPath.empty()) outPath = ofxDefault;
         exportOFX(records, outPath, accountName);
     }
+}
+
+// Lists .csv files in cwd for quick selection; falls back to manual path entry.
+// noFilesPrompt is shown when no csv files are found. Returns absolute path or "".
+static std::string promptCsvFile(const std::string& noFilesPrompt) {
+    std::vector<fs::path> csvFiles;
+    for (auto& entry : fs::directory_iterator(fs::current_path())) {
+        if (entry.is_regular_file() && entry.path().extension() == ".csv")
+            csvFiles.push_back(entry.path().filename());
+    }
+    std::sort(csvFiles.begin(), csvFiles.end());
+    if (!csvFiles.empty()) {
+        std::cout << "CSV files in current directory:\n";
+        for (size_t i = 0; i < csvFiles.size(); ++i)
+            std::cout << "  " << (i + 1) << ") " << csvFiles[i].string() << "\n";
+        std::cout << "Enter number to select, or type a path: ";
+    } else {
+        std::cout << noFilesPrompt;
+    }
+    std::string input;
+    std::getline(std::cin, input);
+    input = trim(input);
+
+    std::string path;
+    bool isNum = !input.empty() && std::all_of(input.begin(), input.end(), ::isdigit);
+    if (isNum && !csvFiles.empty()) {
+        int idx = std::stoi(input) - 1;
+        if (idx < 0 || idx >= (int)csvFiles.size()) {
+            std::cout << "Invalid selection.\n"; return "";
+        }
+        path = (fs::current_path() / csvFiles[idx]).string();
+    } else {
+        path = input;
+    }
+
+    if (path.empty() || !fs::exists(path)) {
+        std::cout << "File not found.\n"; return "";
+    }
+    return path;
+}
+
+static void menuImport(DB& db) {
+    std::string path = promptCsvFile("Path to Fidelity CSV file: ");
+    if (path.empty()) return;
+    menuImportFromPath(db, path);
 }
 
 static void menuListImports(DB& db) {
@@ -1183,10 +1232,8 @@ static void menuDiff(DB& db) {
         dbRecords = db.allRecords();
     }
 
-    std::string path = promptString("Path to YNAB export CSV: ");
-    if (path.empty() || !fs::exists(path)) {
-        std::cout << "File not found.\n"; return;
-    }
+    std::string path = promptCsvFile("Path to YNAB export CSV: ");
+    if (path.empty()) return;
     auto missingFromYNAB = runDiff(dbRecords, path);
 
     if (!missingFromYNAB.empty() &&
