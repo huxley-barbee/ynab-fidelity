@@ -663,6 +663,14 @@ static std::vector<Record> runDiff(const std::vector<Record>& dbRecords, const s
     for (auto& r : dbRecords)
         dbCounts[{r.date, amtStr(r.amount)}]++;
 
+    // Per-key record lists for ambiguous-match detection
+    std::map<Key, std::vector<const Record*>> dbByKey;
+    for (auto& r : dbRecords)
+        dbByKey[{r.date, amtStr(r.amount)}].push_back(&r);
+    std::map<Key, std::vector<const YNABRecord*>> ynabByKey;
+    for (auto& r : ynabRecords)
+        ynabByKey[{r.date, amtStr(r.amount())}].push_back(&r);
+
     std::vector<Record> missingFromYNAB;
     std::map<Key,int> ynabRemaining = ynabCounts;
     for (auto& r : dbRecords) {
@@ -727,8 +735,27 @@ static std::vector<Record> runDiff(const std::vector<Record>& dbRecords, const s
     for (size_t j = 0; j < missingFromDB.size(); ++j)
         if (!ynabConsumed.count(j)) confirmedMissingFromDB.push_back(missingFromDB[j]);
 
+    // Ambiguous matches: same (date, amount) key present on both sides but count > 1 on one side.
+    struct AmbiguousGroup {
+        std::string date, amt;
+        std::vector<const Record*>     dbRecs;
+        std::vector<const YNABRecord*> ynabRecs;
+    };
+    std::vector<AmbiguousGroup> multipleYNAB; // 1+ DB records, 2+ YNAB records for same key
+    std::vector<AmbiguousGroup> multipleDB;   // 2+ DB records, 1+ YNAB records for same key
+    for (auto& [k, dbrecs] : dbByKey) {
+        auto it = ynabByKey.find(k);
+        if (it == ynabByKey.end()) continue;
+        auto& ynabRecs = it->second;
+        if (ynabRecs.size() > 1)
+            multipleYNAB.push_back({k.first, k.second, dbrecs, ynabRecs});
+        if (dbrecs.size() > 1)
+            multipleDB.push_back({k.first, k.second, dbrecs, ynabRecs});
+    }
+
     if (confirmedMissingFromYNAB.empty() && confirmedMissingFromDB.empty() &&
-        probablyBoth.empty() && futureRecords.empty()) {
+        probablyBoth.empty() && futureRecords.empty() &&
+        multipleYNAB.empty() && multipleDB.empty()) {
         std::cout << "✓ Perfect match — all records accounted for on both sides.\n\n";
         return {};
     }
@@ -784,6 +811,26 @@ static std::vector<Record> runDiff(const std::vector<Record>& dbRecords, const s
         }
         std::cout << "\n";
     }
+
+    auto printAmbiguous = [](const std::vector<AmbiguousGroup>& groups, const std::string& title) {
+        std::cout << title << " (" << groups.size() << " group"
+                  << (groups.size() == 1 ? "" : "s") << ")\n";
+        std::cout << std::string(70, '-') << "\n";
+        for (auto& g : groups) {
+            char amt[16]; snprintf(amt, sizeof(amt), "%+.2f", std::stod(g.amt));
+            std::cout << "  " << g.date << "  " << amt << "\n";
+            for (auto* r : g.dbRecs)
+                std::cout << "    DB  : " << r->description.substr(0, 55) << "\n";
+            for (auto* r : g.ynabRecs)
+                std::cout << "    YNAB: " << r->payee.substr(0, 55) << "\n";
+        }
+        std::cout << "\n";
+    };
+
+    if (!multipleYNAB.empty())
+        printAmbiguous(multipleYNAB, "=== DB records with multiple YNAB matches");
+    if (!multipleDB.empty())
+        printAmbiguous(multipleDB,   "=== YNAB records with multiple DB matches");
 
     return confirmedMissingFromYNAB;
 }
