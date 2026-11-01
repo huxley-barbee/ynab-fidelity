@@ -1293,6 +1293,35 @@ static void menuDiff(DB& db) {
 }
 
 // ---------------------------------------------------------------------------
+// Backups
+// ---------------------------------------------------------------------------
+
+static const int kMaxBackups = 3;
+
+static bool filesEqual(const fs::path& a, const fs::path& b) {
+    std::error_code ec;
+    if (fs::file_size(a, ec) != fs::file_size(b, ec) || ec) return false;
+    std::ifstream fa(a, std::ios::binary), fb(b, std::ios::binary);
+    return std::equal(std::istreambuf_iterator<char>(fa), std::istreambuf_iterator<char>(),
+                      std::istreambuf_iterator<char>(fb));
+}
+
+// Rotate dbPath.bak.1 .. dbPath.bak.N, then copy the current db to .bak.1.
+// Skipped if the db is unchanged since the newest backup, so repeated
+// sessions without edits don't push older backups out.
+static void rotateBackups(const std::string& dbPath) {
+    auto bak = [&](int n) { return fs::path(dbPath + ".bak." + std::to_string(n)); };
+
+    if (fs::exists(bak(1)) && filesEqual(dbPath, bak(1))) return;
+
+    fs::remove(bak(kMaxBackups));
+    for (int n = kMaxBackups - 1; n >= 1; --n)
+        if (fs::exists(bak(n))) fs::rename(bak(n), bak(n + 1));
+    fs::copy_file(dbPath, bak(1));
+    std::cout << "Backup saved: " << bak(1).string() << "\n\n";
+}
+
+// ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
 
@@ -1322,6 +1351,11 @@ int main(int argc, char** argv) {
             } catch (std::exception& e) {
                 std::cerr << "Could not open database (wrong password?): " << e.what() << "\n";
                 return 1;
+            }
+            try {
+                rotateBackups(dbPath);
+            } catch (std::exception& e) {
+                std::cerr << "Warning: backup failed: " << e.what() << "\n";
             }
         }
     } catch (std::exception& e) {
